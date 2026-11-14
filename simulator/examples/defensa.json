@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "scenario": "defense",
+  "turns": [
+    {
+      "A": {
+        "action": "Move",
+        "destination": 2
+      },
+      "B": {
+        "action": "Defend",
+        "destination": 0
+      }
+    }
+  ]
+}

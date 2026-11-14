@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "scenario": "standard",
+  "turns": [
+    {
+      "A": {
+        "action": "Build",
+        "destination": 0
+      },
+      "B": {
+        "action": "Build",
+        "destination": 0
+      }
+    },
+    {
+      "A": {
+        "action": "Build",
+        "destination": 0
+      },
+      "B": {
+        "action": "Build",
+        "destination": 0
+      }
+    },
+    {
+      "A": {
+        "action": "Move",
+        "destination": 1
+      },
+      "B": {
+        "action": "Move",
+        "destination": 19
+      }
+    },
+    {
+      "A": {
+        "action": "Move",
+        "destination": 2
+      },
+      "B": {
+        "action": "Move",
+        "destination": 14
+      }
+    },
+    {
+      "A": {
+        "action": "Capture",
+        "destination": 0
+      },
+      "B": {
+        "action": "Capture",
+        "destination": 0
+      }
+    },
+    {
+      "A": {
+        "action": "Move",
+        "destination": 7
+      },
+      "B": {
+        "action": "Move",
+        "destination": 13
+      }
+    },
+    {
+      "A": {
+        "action": "Move",
+        "destination": 12
+      },
+      "B": {
+        "action": "Move",
+        "destination": 12
+      }
+    },
+    {
+      "A": {
+        "action": "Build",
+        "destination": 0
+      },
+      "B": {
+        "action": "Build",
+        "destination": 0
+      }
+    },
+    {
+      "A": {
+        "action": "Build",
+        "destination": 0
+      },
+      "B": {
+        "action": "Build",
+        "destination": 0
+      }
+    },
+    {
+      "A": {
+        "action": "Build",
+        "destination": 0
+      },
+      "B": {
+        "action": "Build",
+        "destination": 0
+      }
+    }
+  ]
+}
