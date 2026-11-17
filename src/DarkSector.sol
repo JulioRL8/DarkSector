@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
+/// @notice Lifecycle of a game: waiting for an opponent, active, or permanently finished.
 enum GameStatus {
     WaitingForPlayer,
     Active,
     Finished
 }
 
+/// @notice Terrain categories; Empty is the zero value used for unassigned map cells.
 enum SectorType {
     Empty,
     Obstacle,
@@ -15,6 +17,7 @@ enum SectorType {
     CentralCore
 }
 
+/// @notice Stored outcome; Pending remains set until normal completion or forfeiture.
 enum GameResult {
     Pending,
     PlayerAWins,
@@ -22,17 +25,20 @@ enum GameResult {
     Draw
 }
 
+/// @notice Participant identity and accumulated energy and points.
 struct Player {
     address account;
     uint32 energy;
     uint32 points;
 }
 
+/// @notice Single fleet per player; zero ships means destroyed and position is its base reference.
 struct Fleet {
     uint8 position;
     uint8 ships;
 }
 
+/// @notice Per-game lifecycle, player resources, fleets, result and current phase deadline.
 struct Game {
     GameStatus status;
     uint8 round;
@@ -45,6 +51,7 @@ struct Game {
     uint256 phaseDeadline;
 }
 
+/// @notice Order actions; existing numeric values must remain stable for commitment encoding.
 enum ActionType {
     Hold,
     Move, 
@@ -53,22 +60,26 @@ enum ActionType {
     Build
 }
 
+/// @notice An action and its original destination; only Move interprets destination as a target.
 struct Order {
     ActionType action;
     uint8 destination;
 }
 
+/// @notice Commit locks order hashes; Reveal opens the committed orders before resolution.
 enum RoundPhase {
     Commit,
     Reveal
 }
 
+/// @notice One participant's pending order hash and per-round commit/reveal flags.
 struct OrderCommitment {
     bytes32 commitment;
     bool committed;
     bool revealed;
 }
 
+/// @notice Original positions and movement intentions used to resolve a simultaneous encounter.
 struct CombatContext {
     uint8 originA;
     uint8 originB;
@@ -79,65 +90,131 @@ struct CombatContext {
     bool swapping;
 }
 
+/// @title Dark Sector
+/// @notice A two-player, ten-round space strategy game with simultaneous committed orders.
+/// @dev Uses deterministic combat, persistent territory income and permissionless timeout
+///      recovery. Games are independent entries keyed by ID. Clients generate commitments
+///      off-chain and retain their secrets; private mappings do not make chain data secret.
 contract DarkSector {
+    /// @dev Board width and height. The fixed scenario assumes five.
     uint dimension = 5;
+    /// @dev Next unused game ID; IDs below this value exist.
     uint256 currentGameId = 0;
+    /// @dev Last playable round, including its income and scoring.
     uint256 constant maxRound = 10;
 
+    /// @dev Independent game states indexed by creation ID.
     mapping(uint256 => Game) games;
+    /// @dev Terrain arrays initialized when the second player joins.
     mapping(uint256 => SectorType[]) maps;
 
+    /// @dev Persistent sector control; address(0) denotes an unclaimed sector.
     mapping(uint256 => mapping(uint8 => address)) 
         internal sectorOwners;
+    /// @dev Validated effective orders awaiting simultaneous resolution.
     mapping(uint256 => mapping(address => Order)) 
         internal orders;
+    /// @dev Per-game participant commitments, cleared when a round closes.
     mapping(uint256 => mapping(address => OrderCommitment))
         internal commitments;
 
+    /// @notice Accumulated reveal faults for a participant in a game.
+    /// @dev Two faults cause forfeiture. Counts persist across rounds and after game completion;
+    ///      the generated getter returns zero for entries that have never been written.
     mapping(uint256 => mapping(address => uint8))
         public revealFaults;
 
+    /// @dev Duration used for both Commit and Reveal windows.
     uint256 constant revealTime = 5 minutes;
 
     // Errors
+    /// @notice The creator attempted to occupy the second player slot in their own game.
     error InvalidAddress();
+    /// @notice The game, phase or reveal state does not permit the requested operation.
     error InvalidStatus();
+    /// @notice The caller is not a participant authorized for the requested player action.
     error Forbidden();
+    /// @notice The caller has already submitted a commitment for the current round.
     error AlreadyReady();
+    /// @notice The requested game ID has not been created.
     error GameDoesNotExists();
+    /// @notice Legacy action-validation error; the current reveal flow converts illegal orders to Hold instead.
     error IncorrectMove();
+    /// @notice A commit or reveal was submitted at or after its phase deadline.
     error DeadlineReached();
+    /// @notice The revealed order and salt do not reproduce the stored commitment.
     error HashNotValid();
+    /// @notice Timeout recovery was requested before the current phase deadline.
     error DeadlineNotReached();
 
     // Events 
+    /// @notice Emitted when a waiting game is registered.
+    /// @param gameId Identifier assigned to the new game.
+    /// @param creator Address occupying player A's slot.
     event GameCreated(uint256 indexed gameId, address indexed creator);
+    /// @notice Emitted when player B joins and the game becomes active.
+    /// @param gameId Identifier of the started game.
+    /// @param playerA Address of the creator.
+    /// @param playerB Address of the joining participant.
     event GameStarted(
         uint256 indexed gameId,
         address indexed playerA,
         address indexed playerB
     );
+    /// @notice Legacy readiness event retained in the ABI; not emitted by the commit-reveal flow.
+    /// @param gameId Identifier of the game.
+    /// @param player Address of the participant.
     event PlayerReady(uint256 indexed gameId, address indexed player);
+    /// @notice Emitted after a normal round's actions and income have been applied.
+    /// @param gameId Identifier of the resolved game.
+    /// @param round Number of the round just completed, before any increment.
     event RoundResolved(uint256 indexed gameId, uint8 round);
+    /// @notice Emitted after normal completion or forfeiture marks a game as finished.
+    /// @param gameId Identifier of the finished game.
     event GameFinished(uint256 indexed gameId); 
+    /// @notice Emitted when a living fleet actually changes position.
+    /// @dev Destruction resets and unsuccessful exchanges do not emit movement events.
+    /// @param gameId Identifier of the game.
+    /// @param user Address controlling the moving fleet.
+    /// @param origin Sector occupied before movement.
+    /// @param destination Sector occupied after resolution.
     event FleetMoved(
         uint256 gameId, 
         address indexed user, 
         uint256 origin, 
         uint256 destination
     );
+    /// @notice Emitted when a surviving Capture order transfers sector control.
+    /// @param gameId Identifier of the game.
+    /// @param position Index of the captured station or core.
+    /// @param previousOwner Prior owner, or address(0) for an unclaimed sector.
+    /// @param newOwner Address of the capturing participant.
     event SectorCaptured(
         uint256 gameId,
         uint8 position,
         address indexed previousOwner,
         address indexed newOwner
     );
+    /// @notice Emitted with the stored result and accumulated scores when a game ends.
+    /// @dev Forfeiture may determine the winner independently of the point totals.
+    /// @param gameId Identifier of the game.
+    /// @param result Final winner or draw.
+    /// @param pointsA Player A's accumulated points.
+    /// @param pointsB Player B's accumulated points.
     event GameResultDeclared(
         uint256 indexed gameId,
         GameResult result,
         uint32 pointsA,
         uint32 pointsB
     );
+    /// @notice Emitted with simultaneous casualties before fleet state is updated.
+    /// @param gameId Identifier of the game.
+    /// @param originA Player A's position before the encounter.
+    /// @param originB Player B's position before the encounter.
+    /// @param targetA Player A's proposed destination, not necessarily the final position.
+    /// @param targetB Player B's proposed destination, not necessarily the final position.
+    /// @param lossesA Number of player A's ships destroyed.
+    /// @param lossesB Number of player B's ships destroyed.
     event CombatResolved(
         uint256 indexed gameId,
         uint8 originA,
@@ -147,18 +224,32 @@ contract DarkSector {
         uint8 lossesA,
         uint8 lossesB
     );
+    /// @notice Emitted when combat reduces a living fleet to zero ships.
+    /// @param gameId Identifier of the game.
+    /// @param player Address whose fleet was destroyed.
     event FleetDestroyed(
         uint256 indexed gameId,
         address indexed player
     );
+    /// @notice Emitted after a Build order pays its cost and adds one ship.
+    /// @param gameId Identifier of the game.
+    /// @param player Address building or rebuilding its fleet.
+    /// @param totalShips Number of ships in that fleet after construction.
     event ShipBuilt(
         uint256 indexed gameId,
         address indexed player,
         uint8 totalShips
     );
 
+    /// @notice Deploys the game contract without creating or starting a game.
+    /// @dev Individual games are initialized explicitly through createGame and joinGame.
     constructor() { }
 
+    /// @notice Creates a waiting game with the caller as player A.
+    /// @dev Assigns a unique, zero-based ID, five energy and three ships per player slot,
+    ///      and round one. The map is initialized and the commit deadline is renewed on join.
+    ///      Emits GameCreated. Does not require a payment or start gameplay.
+    /// @return gameId Identifier of the newly created game.
     function createGame() external returns(uint256 gameId) {
         games[currentGameId] = Game({
             status: GameStatus.WaitingForPlayer,
@@ -188,6 +279,11 @@ contract DarkSector {
         emit GameCreated(gameId, msg.sender);
     }
 
+    /// @notice Joins a waiting game as player B and starts its first commit phase.
+    /// @dev Reverts for an unknown game, a game that is not waiting, or the creator joining
+    ///      their own game. Initializes the fixed map and a fresh five-minute deadline.
+    ///      Emits GameStarted.
+    /// @param gameId Identifier of the game to join.
     function joinGame(uint256 gameId) external {
         require(gameId < currentGameId, GameDoesNotExists());
 
@@ -203,6 +299,11 @@ contract DarkSector {
         emit GameStarted(gameId, game.playerA.account, msg.sender);
     }
 
+    /// @notice Returns the stored state of an existing game.
+    /// @dev Includes players, fleets, round, phase, deadline and result. Pending commitments
+    ///      and orders are not included. Reverts if the game does not exist.
+    /// @param gameId Identifier of the game to inspect.
+    /// @return The game state copied into memory.
     function getGame(uint256 gameId) external view
         returns (Game memory) {
         require(gameId < currentGameId, GameDoesNotExists());
@@ -210,6 +311,12 @@ contract DarkSector {
         return games[gameId];
     }
 
+    /// @notice Returns the terrain type at a position in a game's initialized map.
+    /// @dev Reverts for an unknown game or an out-of-bounds array index. The map is empty
+    ///      before a second player joins, so terrain cannot be queried during that period.
+    /// @param position Zero-based sector index; valid initialized positions are 0 through 24.
+    /// @param gameId Identifier of the game whose map is queried.
+    /// @return The terrain type at the requested position.
     function getSectorType(uint8 position, uint256 gameId) external view
         returns (SectorType) {
         require(gameId < currentGameId, GameDoesNotExists());
@@ -217,6 +324,15 @@ contract DarkSector {
         return maps[gameId][position];
     }
 
+    /// @notice Locks the caller's order hash for the current round.
+    /// @dev Only a participant in an active game may commit, once per round, during Commit
+    ///      and strictly before the deadline. Both commitments open Reveal with a fresh deadline.
+    ///      The expected hash is keccak256(abi.encode(address(this), block.chainid, gameId,
+    ///      game.round, msg.sender, action, destination, salt)); clients must use the same types.
+    ///      Use an unpredictable salt and retain the original order and salt until revelation.
+    ///      The committed flag records participation independently of the hash value.
+    /// @param gameId Identifier of the active game.
+    /// @param commitment Hash binding the order and salt to this execution context.
     function commitOrders(uint256 gameId, bytes32 commitment) external {
         require(gameId < currentGameId, GameDoesNotExists());
 
@@ -245,6 +361,16 @@ contract DarkSector {
         }
     }
 
+    /// @notice Reveals the caller's committed order and resolves the round when all required reveals are available.
+    /// @dev Requires an active game, Reveal phase, an unrevealed commitment, and an open
+    ///      deadline. A mismatching hash reverts without deleting the commitment. A matching
+    ///      but illegal order is recorded as Hold. No action executes on the first reveal
+    ///      if the other participant still owes a reveal. A participant who never committed
+    ///      does not owe a reveal after commit-timeout recovery.
+    /// @param gameId Identifier of the active game.
+    /// @param action Action originally included in the commitment.
+    /// @param destination Original uint8 destination; affects movement only but is always hashed.
+    /// @param salt Original secret used to construct the commitment.
     function revealOrders(
         uint256 gameId,
         ActionType action,
@@ -305,6 +431,12 @@ contract DarkSector {
         }
     }
 
+    /// @notice Returns the address controlling a sector, or address(0) if it is unclaimed.
+    /// @dev Control persists when a fleet leaves or is destroyed. Reverts for an unknown
+    ///      game or a position outside the initialized map, including queries before join.
+    /// @param gameId Identifier of the game to inspect.
+    /// @param position Zero-based sector index within the initialized map.
+    /// @return Address of the controlling player, or the zero address for unclaimed sectors.
     function getSectorOwner(
         uint256 gameId,
         uint8 position
@@ -314,6 +446,14 @@ contract DarkSector {
         return sectorOwners[gameId][position];
     }
 
+    /// @notice Advances an expired phase or ends the game after repeated reveal faults.
+    /// @dev Callable by anyone for an active game at or after phaseDeadline. With no commits,
+    ///      resolves both players as Hold. With one commit, opens a fresh Reveal window.
+    ///      During Reveal, committed players who did not reveal receive a fault and Hold.
+    ///      Two accumulated reveal faults cause forfeiture; simultaneous forfeitures draw.
+    ///      Forfeiture clears pending data and emits final events without actions or income.
+    ///      Otherwise the round closes normally. Time passing alone does not execute this call.
+    /// @param gameId Identifier of the game whose deadline has expired.
     function advanceAfterTimeout(uint256 gameId) external {
         require(gameId < currentGameId, GameDoesNotExists());
 
@@ -405,6 +545,11 @@ contract DarkSector {
 
     // Internal
 
+    /// @notice Resolves one round and either opens the next commit phase or finishes the game.
+    /// @dev Call only after all required reveals or timeout defaults are ready. Includes
+    ///      round-ten income before calculating the result. Emits RoundResolved before
+    ///      incrementing the round; the final round remains numbered ten.
+    /// @param gameId Identifier of the active game whose round is ready to close.
     function _finishRound(uint256 gameId) internal {
         Game storage game = games[gameId];
 
@@ -431,6 +576,11 @@ contract DarkSector {
         }
     }
 
+    /// @notice Applies the ordered gameplay effects and clears pending round data.
+    /// @dev Resolves movement/combat, surviving captures, construction, then income/points.
+    ///      Deletes both players' orders and commitments, but preserves cumulative reveal faults.
+    ///      Does not itself change the round number, phase, deadline or final result.
+    /// @param gameId Identifier of the game to resolve.
     function _resolveRound(uint256 gameId) internal {
         Game storage game = games[gameId];
 
@@ -445,6 +595,12 @@ contract DarkSector {
         delete commitments[gameId][game.playerB.account];
     }
 
+    /// @notice Charges valid movement attempts and resolves destinations or combat.
+    /// @dev Expects orders already normalized by _resolveAction or timeout defaults.
+    ///      Combat requires two living fleets and a shared destination or position exchange.
+    ///      Moving into a sector vacated toward a third sector does not cause combat.
+    ///      Each Move pays one energy even if combat destroys the fleet or prevents arrival.
+    /// @param gameId Identifier of the game whose movement orders are resolved.
     function _resolveMovementAndCombat(uint256 gameId) internal {
         Game storage game = games[gameId];
         CombatContext memory context;
@@ -506,6 +662,13 @@ contract DarkSector {
         }
     }
 
+    /// @notice Applies simultaneous casualties and the final positions of both fleets.
+    /// @dev Expects a context describing a collision between living fleets. Survivors occupy
+    ///      their target except in an exchange, where they stay at their origin. Destroyed
+    ///      fleets have zero ships and their base as a reference position. Emits CombatResolved,
+    ///      FleetDestroyed for each destroyed fleet, and FleetMoved for relocated survivors.
+    /// @param gameId Identifier of the game containing the combatants.
+    /// @param context Original positions, proposed destinations and movement/exchange flags.
     function _resolveCombat(
         uint256 gameId,
         CombatContext memory context
@@ -569,6 +732,15 @@ contract DarkSector {
         }
     }
 
+    /// @notice Calculates survivors using each opponent's starting combat strength.
+    /// @dev Strength equals ships plus one for Defend. Casualties are simultaneous and capped
+    ///      at the fleet's ship count. Inputs are expected to respect the game cap of ten ships.
+    /// @param shipsA Number of player A's ships before combat.
+    /// @param shipsB Number of player B's ships before combat.
+    /// @param defendingA Whether player A's effective order is Defend.
+    /// @param defendingB Whether player B's effective order is Defend.
+    /// @return survivorsA Number of player A's ships remaining after enemy damage.
+    /// @return survivorsB Number of player B's ships remaining after enemy damage.
     function _calculateCombat(
         uint8 shipsA,
         uint8 shipsB,
@@ -585,11 +757,20 @@ contract DarkSector {
         survivorsB = shipsB - _min(shipsB, strengthA);
     }
 
+    /// @notice Returns the smaller of two ship-count values.
+    /// @param a First value.
+    /// @param b Second value.
+    /// @return The minimum of a and b.
     function _min(uint8 a, uint8 b) internal pure returns(uint8) {
         if (a < b) return a;
         else return b;
     }
 
+    /// @notice Transfers sectors to players whose Capture orders survived combat.
+    /// @dev Expects validated Capture orders on capturable terrain. A fleet with zero ships
+    ///      cannot capture. Merely winning a combat never transfers ownership. Emits SectorCaptured
+    ///      with the previous and new owner; the new owner receives this round's territory income.
+    /// @param gameId Identifier of the game whose captures are resolved.
     function _resolveCaptures(uint256 gameId) internal {
         Game storage game = games[gameId];
 
@@ -621,6 +802,11 @@ contract DarkSector {
         }
     }
 
+    /// @notice Charges construction orders and adds one ship at each building fleet's base.
+    /// @dev Expects validated Build orders with at least three energy and fewer than ten ships.
+    ///      Runs after combat, so newly built ships do not fight this round. Zero-ship fleets
+    ///      have already been normalized to their base and can be rebuilt. Emits ShipBuilt.
+    /// @param gameId Identifier of the game whose construction orders are resolved.
     function _resolveBuilds(uint256 gameId) internal {
         Game storage game = games[gameId];
         Order memory orderA = orders[gameId][game.playerA.account];
@@ -644,6 +830,11 @@ contract DarkSector {
         }
     }
 
+    /// @notice Credits base income and the territories controlled after this round's captures.
+    /// @dev Each player receives two base energy regardless of fleet position or survival.
+    ///      Each station gives its owner one energy and one point; the core gives one energy
+    ///      and three points. Applies on round ten too. Does not change territory ownership.
+    /// @param gameId Identifier of the game receiving end-of-round income.
     function _distributeIncomeAndPoints(uint256 gameId) internal {
         Game storage game = games[gameId];
 
@@ -674,6 +865,10 @@ contract DarkSector {
         }
     }
 
+    /// @notice Constructs the fixed five-by-five terrain map in memory.
+    /// @dev Bases: 0 and 24. Stations: 2, 10, 14, 22. Core: 12. Obstacles: 6, 8, 16, 18.
+    ///      All other positions retain the default Empty value. Does not initialize ownership.
+    /// @return A terrain array of dimension squared elements.
     function initializeScenario() internal view returns(SectorType[] memory) {
         SectorType[] memory map = new SectorType[](dimension * dimension);
 
@@ -696,6 +891,11 @@ contract DarkSector {
         return map;
     }
 
+    /// @notice Stores the winner after the final round's points have been distributed.
+    /// @dev Compares total points, then currently controlled energy stations. The core does
+    ///      not count toward the tiebreak. Equal points and station counts produce a draw.
+    ///      Does not change status or emit final events; the caller performs those steps.
+    /// @param gameId Identifier of the game whose final score is evaluated.
     function _checkResult(uint256 gameId) internal {
         Game storage game = games[gameId];
 
@@ -716,6 +916,11 @@ contract DarkSector {
         }
     }
 
+    /// @notice Counts the energy stations currently controlled by each player.
+    /// @dev Ignores the core, bases, empty sectors, obstacles and unclaimed stations.
+    /// @param gameId Identifier of the game whose territory is counted.
+    /// @return playerAStations Number of energy stations controlled by player A.
+    /// @return playerBStations Number of energy stations controlled by player B.
     function _getElectricStations(uint256 gameId) internal view returns(uint32 playerAStations, uint32 playerBStations) {
         Game memory game = games[gameId];
 
@@ -733,6 +938,18 @@ contract DarkSector {
         }
     }
 
+    /// @notice Normalizes a revealed order, returning Hold if it violates the action rules.
+    /// @dev Relies on msg.sender being the participant represented by player, as in revealOrders.
+    ///      Checks movement geometry, energy, fleet survival and the enemy-base restriction;
+    ///      checks capture terrain/ownership; checks construction energy, base terrain and cap.
+    ///      Defend requires a living fleet. Preserves destination even for Hold; only Move uses it.
+    ///      No energy is charged and no game state is modified here.
+    /// @param gameId Identifier of the game supplying terrain and ownership.
+    /// @param player Snapshot of the revealing participant's account and resources.
+    /// @param fleet Snapshot of that participant's fleet before round resolution.
+    /// @param action Action to validate.
+    /// @param destination Destination originally revealed by the participant.
+    /// @return The requested legal order, or Hold carrying the same destination.
     function _resolveAction(
         uint256 gameId,
         Player memory player,
@@ -779,6 +996,13 @@ contract DarkSector {
         });
     }
 
+    /// @notice Checks terrain, bounds and orthogonal adjacency for a proposed movement.
+    /// @dev Does not check ships, energy, enemy bases or occupancy; those concerns belong to
+    ///      action validation and simultaneous resolution. The current position is assumed valid.
+    /// @param previousPosition Fleet snapshot containing the current position.
+    /// @param map_ Initialized terrain array to query.
+    /// @param newPosition Proposed zero-based sector index.
+    /// @return True if the destination is in bounds, non-obstructed and exactly one orthogonal step away.
     function checkMove(Fleet memory previousPosition, 
                         SectorType[] memory map_,
                         uint256 newPosition) internal view returns(bool) {
@@ -800,11 +1024,22 @@ contract DarkSector {
         return true;
     }
 
+    /// @notice Converts a row-major sector index into row and column coordinates.
+    /// @dev Coordinates are zero-based. The caller must supply a nonzero dimension; no board
+    ///      bounds are checked here.
+    /// @param position Linear sector index.
+    /// @param dimension_ Number of columns in the square board.
+    /// @return row Zero-based row of the position.
+    /// @return column Zero-based column of the position.
     function getRowAndColumn(uint256 position, uint256 dimension_) internal pure returns(uint256 row, uint256 column) {
         row = position / dimension_;
         column = position % dimension_;
     }
 
+    /// @notice Computes the absolute difference between two unsigned values.
+    /// @param first First coordinate or value.
+    /// @param second Second coordinate or value.
+    /// @return Nonnegative distance between first and second.
     function diff(uint256 first, uint256 second) internal pure returns (uint256) {
         return first >= second ? first - second : second - first;
     }
